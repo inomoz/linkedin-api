@@ -7,9 +7,8 @@ from time import sleep
 from urllib.parse import urlencode
 import json
 
-from linkedin_api.utils.helpers import get_id_from_urn
-
-from linkedin_api.client import Client
+from .utils.helpers import get_id_from_urn
+from .client import Client
 
 logger = logging.getLogger(__name__)
 
