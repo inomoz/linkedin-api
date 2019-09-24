@@ -49,28 +49,29 @@ class Client(object):
         "Accept-Language": "en-us",
     }
 
-    def __init__(self, *, debug=False, refresh_cookies=False, proxies={}):
+    def __init__(self, *, debug=False, refresh_cookies=False, proxies={}, cookies=None, api_cookies=None):
         self.session = requests.session()
         self.session.proxies.update(proxies)
         self.session.headers.update(Client.REQUEST_HEADERS)
         self.proxies = proxies
         self.logger = logger
         self._use_cookie_cache = not refresh_cookies
+        self._cookies = cookies
         logging.basicConfig(level=logging.DEBUG if debug else logging.INFO)
+        self.api_cookies = api_cookies
 
     def _request_session_cookies(self):
         """
         Return a new set of session cookies as given by Linkedin.
         """
-        if self._use_cookie_cache:
+        if self._use_cookie_cache and self.api_cookies:
             self.logger.debug("Attempting to use cached cookies")
             try:
-                with open(settings.COOKIE_FILE_PATH, "rb") as f:
-                    cookies = pickle.load(f)
-                    if cookies:
-                        return cookies
+                cookies = pickle.loads(self.api_cookies)
+                if cookies:
+                    return cookies
             except FileNotFoundError:
-                self.logger.debug("Cookie file not found. Requesting new cookies.")
+                self.logger.debug("Cookies not found! Requesting new cookies.")
 
         res = requests.get(
             f"{Client.AUTH_BASE_URL}/uas/authenticate",
@@ -88,12 +89,14 @@ class Client(object):
         self.session.headers["csrf-token"] = self.session.cookies["JSESSIONID"].strip(
             '"'
         )
-        with open(settings.COOKIE_FILE_PATH, "wb") as f:
-            pickle.dump(cookiejar, f)
 
     @property
     def cookies(self):
         return self.session.cookies
+
+    def alternate_authenticate(self):
+        self._set_session_cookies(self._request_session_cookies())
+        self.api_cookies = pickle.dumps(self.session.cookies, pickle.HIGHEST_PROTOCOL)
 
     def authenticate(self, username, password):
         """
@@ -114,7 +117,8 @@ class Client(object):
             data=payload,
             cookies=self.session.cookies,
             headers=Client.AUTH_REQUEST_HEADERS,
-            proxies=self.proxies
+            proxies=self.proxies,
+            timeout=settings.LOGIN_TIMEOUT
         )
 
         data = res.json()
@@ -129,3 +133,4 @@ class Client(object):
             raise Exception()
 
         self._set_session_cookies(res.cookies)
+        self.api_cookies = pickle.dumps(res.cookies, pickle.HIGHEST_PROTOCOL)
