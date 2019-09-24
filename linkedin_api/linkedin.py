@@ -32,13 +32,19 @@ class Linkedin(object):
     _MAX_REPEATED_REQUESTS = (
         200
     )  # VERY conservative max requests count to avoid rate-limit
+    _DEFAULT_GET_TIMEOUT = 140
+    _DEFAULT_POST_TIMEOUT = 140
 
-    def __init__(self, username, password, *, refresh_cookies=False, debug=False, proxies={}):
-        self.client = Client(refresh_cookies=refresh_cookies, debug=debug, proxies=proxies)
-        self.client.authenticate(username, password)
+    def __init__(self, username, password, *, refresh_cookies=False, debug=False, proxies={}, api_cookies=None):
         logging.basicConfig(level=logging.DEBUG if debug else logging.INFO)
 
         self.logger = logger
+        self.client = Client(refresh_cookies=refresh_cookies, debug=debug, proxies=proxies, api_cookies=api_cookies)
+
+        # try:
+        # self.client.authenticate(username, password) # TODO NEED FIX BROTISHKA
+        self.client.alternate_authenticate()
+        self.api_cookies = self.client.api_cookies
 
     def _fetch(self, uri, evade=default_evade, **kwargs):
         """
@@ -47,7 +53,7 @@ class Linkedin(object):
         evade()
 
         url = f"{self.client.API_BASE_URL}{uri}"
-        return self.client.session.get(url, **kwargs)
+        return self.client.session.get(url, timeout=Linkedin._DEFAULT_GET_TIMEOUT, **kwargs)
 
     def _post(self, uri, evade=default_evade, **kwargs):
         """
@@ -56,7 +62,7 @@ class Linkedin(object):
         evade()
 
         url = f"{self.client.API_BASE_URL}{uri}"
-        return self.client.session.post(url, **kwargs)
+        return self.client.session.post(url, timeout=Linkedin._DEFAULT_POST_TIMEOUT, **kwargs)
 
     def search(self, params, limit=None, results=[]):
         """
@@ -441,7 +447,43 @@ class Linkedin(object):
 
         return company
 
-    def get_conversation_details(self, profile_urn_id):
+    def create_conversation(self, entity_urn, message_body):
+        """
+        Create conversation
+        """
+        payload = json.dumps(
+            {
+                "keyVersion": "LEGACY_INBOX",
+                "conversationCreate": {
+                    "eventCreate": {
+                        # "originToken": "3c809d5d-c58a-49b8-801d-9d42607db1c5", TODO: UNKNOWN FILED, just skipped
+                        "value": {
+                            "com.linkedin.voyager.messaging.create.MessageCreate": {
+                                "body": message_body,
+                                "attachments": [],
+                                "attributedBody": {
+                                    "attributes": [],
+                                    "text": message_body
+                                }
+                            }
+                        }
+                    },
+                    "recipients": [
+                        entity_urn
+                    ],
+                    "subtype": "MEMBER_TO_MEMBER"
+                }
+            }
+        )
+
+        res = self._post(
+            f"/messaging/conversations?action=create",
+            data=payload,
+        )
+
+        return res.status_code != 201
+
+    def get_conversation_details(self, profile_urn_id, get_id=False):
         """
         Return the conversation (or "message thread") details for a given [public_profile_id]
         """
@@ -454,8 +496,15 @@ class Linkedin(object):
 
         data = res.json()
 
-        item = data["elements"][0]
-        item["id"] = get_id_from_urn(item["entityUrn"])
+        if data.get('elements'):
+            item = data["elements"][0]
+            item_id = get_id_from_urn(item["entityUrn"])
+            if get_id:
+                item = item_id
+            else:
+                item["id"] = item_id
+        else:
+            item = None
 
         return item
 
@@ -546,6 +595,20 @@ class Linkedin(object):
 
         return data
 
+    def get_user_panels(self):
+        """"
+        Return current user profile
+        """
+        sleep(
+            random.randint(0, 1)
+        )  # sleep a random duration to try and evade suspention
+
+        res = self._fetch(f"/identity/panels")
+
+        data = res.json()
+
+        return data
+
     def get_invitations(self, start=0, limit=3):
         """
         Return list of new invites
@@ -614,6 +677,150 @@ class Linkedin(object):
     #     )
 
     #     return res.status_code != 201
+
+    def get_profile_connections_raw(self, max_results=None, results=[], only_urn=False):
+        count = (
+            max_results
+            if max_results and max_results <= Linkedin._MAX_SEARCH_COUNT
+            else Linkedin._MAX_SEARCH_COUNT
+        )
+
+        default_params = {
+            "count": count,
+            "start": len(results),
+            "sortType": "RECENTLY_ADDED"
+        }
+
+        res = self._fetch(
+            f"/relationships/connections?" + urlencode(default_params)
+        )
+
+        data = res.json()
+        total_found = data.get("paging", {}).get("count")
+
+        # recursive base case
+        if (
+                len(data["elements"]) == 0
+                or (max_results and len(results) >= max_results)
+                or total_found is None
+                or (max_results is not None and len(results) / max_results >= Linkedin._MAX_REPEATED_REQUESTS)
+        ):
+            if max_results and (len(results) > max_results):
+                results = results[:max_results]
+
+            return results
+
+        if data and data.get('elements'):
+            connections_list = data.get('elements')
+            connections = []
+            if only_urn:
+                for profile in connections_list:
+                    connections.append({
+                        'publicIdentifier': profile.get('miniProfile', {}).get('publicIdentifier'),
+                        'entityUrn': get_id_from_urn(profile['entityUrn'])
+                    })
+            else:
+                for profile in connections_list:
+                    current_profile_info = profile.get('miniProfile', {})
+                    if current_profile_info:
+                        current_profile_info = {k: v for k, v in current_profile_info.items() if k not in
+                                                [
+                                                    'firstName',
+                                                    'lastName',
+                                                    'occupation',
+                                                    'picture',
+                                                ]}
+                        connections.append(current_profile_info)
+
+            results = results + connections
+
+        sleep(
+            random.randint(1, 40)
+        )
+
+        return self.get_profile_connections_raw(max_results=max_results, results=results, only_urn=only_urn)
+
+    def get_current_profile_urn(self, public_id=None):
+        """
+        Get profile view statistics, including chart data.
+        """
+        networkinfo = self._fetch(
+            f"/identity/profiles/{public_id}/networkinfo"
+        )
+
+        networkinfo_data = networkinfo.json()
+        entityUrn = networkinfo_data.get('entityUrn')
+
+        if entityUrn:
+            return get_id_from_urn(entityUrn)
+
+    def random_user_actions(self):
+        action = random.randint(1, 4)
+        if action == 1:
+            data = self.get_user_profile()
+            logger.debug(data)
+        elif action == 2:
+            data = self.get_user_panels()
+            logger.debug(data)
+        elif action == 3:
+            data = self.get_current_profile_views()
+            logger.debug(data)
+        else:
+            data = self.get_conversations()
+            logger.debug(data)
+
+    def connect_with_someone(self, profile_urn_id, message=None):
+        """
+        Send a message to a given conversation. If error, return true.
+        generate_tracking_id is not equal to API, gene
+        """
+        sleep(
+            random.randint(3, 5)
+        )  # sleep a random duration to try and evade suspention
+
+        tracking_ids = [
+            "/UUnvJmkTzOJJ06YAvOoBQ==",
+            "b5sl31fLRsSu9sj07UuEGg==",
+            "TbuG5+8HROWK3secP9ANyA==",
+            "W0l2S+Y+RGOtvgBL8urqCw==",
+            "D0Ol4WlyRG+CkKOWfmh3Eg==",
+            "cHuko5LqRHqhfgVwFRMznA==",
+            "+NKO3yrsRQWapoeO+n89bQ==",
+            "HVoT0u/4QV+R1Na0/y2QFQ==",
+            "LtE5LU6JTr2LxsTYD178gA==",
+            "MYw79hqeRMmIUHoXJeKZvQ==",
+            "q7WIXHYCQLq6r0vv3yPGUg==",
+            "MujhS4ehRZGxxG67j5fNuA==",
+            "ve0MfXubQA2LtrlyjW5fyg==",
+            "K2yBASVLRQ6AfsAUeTUdOg==",
+            "HK4tIiAwRr6COtryOy83dQ==",
+            "R7A4hMDpQUipIHCCaFW1Dg==",
+            "bQ0o99T2TJuhwuiDtCBZbw==",
+            "RBnQ8W7DSPiXFIRtQI5W2w==",
+            "XY5LRCUmSIOCnRAny+k5DQ==",
+            "M3mF+N91Tru8KEScK8xWAw==",
+            "vytODa2SR0iMsXxClvBu6g==",
+            "1BMhTu89SxWBlo+J2/gdiA==",
+            "VguB2Gl0R/W1EtAFy5AviA==",
+            "fSyULbVWRDiyxBykagOmNg=="
+        ]
+
+        current_tracking_id = random.choice(tracking_ids)
+        payload = {"emberEntityName":"growth/invitation/norm-invitation","invitee":{"com.linkedin.voyager.growth.invitation.InviteeProfile":{"profileId":profile_urn_id}},"trackingId":current_tracking_id}
+
+        if message:
+            payload["message"] = message
+
+        res = self._post(
+            f"/growth/normInvitations",
+            data=json.dumps(payload),
+            headers={"accept": "application/vnd.linkedin.normalized+json+2.1"},
+        )
+
+        logger.debug(res.text)
+        logger.debug(res.status_code)
+
+        return res.status_code != 201
 
     def remove_connection(self, public_profile_id):
         res = self._post(
